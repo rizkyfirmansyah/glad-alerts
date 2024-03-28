@@ -20,96 +20,90 @@ Notes:
 
 """
 
-import io
-import pickle
 import os.path
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
-
-# ID of the folder to be downloaded.
-# ID can be obtained from the URL of the folder
-FOLDER_ID = '1gRBRE2qdhOo0Jqse3Hmzu0zTTn6S8hJp' # example of drive ID
-FILE_DIR = os.getcwd()
+from retry import retry
+import multiprocessing
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-def get_service(api_name, api_version, scopes, key_file_location):
-    """
-    Get a service to communicates with Google API
-    Args:
-        api_name: The name of the api to connect to.
-        api_version: The api version to connect to.
-        scopes: A list auth scopes to authorize for the application.
-        key_file_location: The path to a valid service account JSON key file.
+def authenticate(key_iam):
+    credentials_file = key_iam
+    credentials = service_account.Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
+    return credentials
 
-    Returns:
-        A service that is connected to the specified API.
-    """
-    credentials = service_account.Credentials.from_service_account_file(key_file_location)
-    scoped_credentials = credentials.with_scopes(scopes)
+@retry(tries=10, delay=1, backoff=2)
+def fetch_files(files, out_path, drive_service):
+    for file in files:
+        file_id = file['id']
+        file_name = os.path.join(out_path, file['name'])
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = open(file_name, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        
+        try:
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                print(f"Downloading {file_name}: {int(status.progress() * 100)} %")
+        finally:
+            fh.close()
+            # delete the files right after downloaded
+            drive_service.files().delete(fileId=file['id']).execute()
+            print(f"Deleted file with ID: {file['id']}")
 
-    # Build the service object
-    service = build(api_name, api_version, credentials=scoped_credentials)
+@retry(tries=10, delay=3, backoff=2)
+def download_files_in_folder(drive_folder, drive_service, out_path, pool):
+    folder_id = None
+    results = drive_service.files().list(q=f"name='{drive_folder}'", fields="files(id)").execute()
+    files = results.get('files', [])
 
-    return service
-
-
-def main():
-    """
-    Download all files in the specified folder in Google Drive
-    """
-    creds = None
-    keyfile = os.path.join(os.getcwd(), 'gee-service.json')
-    try:
-        service = get_service(api_name='drive', api_version='v3', scopes=SCOPES, key_file_location=keyfile)
-
-    except HttpError as error:
-        # TODO(developer) - Handle errors from drive API.
-        print(f'An error occurred: {error}')
-
-    page_token = None
-    
-    while True:
-        folderid = service.files().get(fileId=FOLDER_ID).execute()['id']
-        print(service.files().list().execute().get('files', []))
-
-        results = service.files().list(
-            q=f"'{FOLDER_ID}' in parents",
-            pageSize=10,
-            fields="nextPageToken, files(id, name)",
-            pageToken=page_token).execute()
-        items = results.get('files', [])
-
-        if not items:
-            print("No files found.")
-        else:
-            for item in items:
-                file_id = item['id']
-                file_name = item['name']
-                print(f'{file_name} ({file_id})')
-                
-                request = service.files().get_media(fileId=file_id)
-                with open(FILE_DIR+file_name, 'wb') as fh:
-                    downloader = MediaIoBaseDownload(fh, request)
-                    done = False
-                    while done is False:
-                        status, done = downloader.next_chunk()
-                        print(f'Download {int(status.progress() * 100)}')
+    if not files:
+        print(f"No files found in the folder {drive_folder}")
+    else:
+        if files:
+            folder_id = files[0]['id']
+            # list all files in the folder
+            page_token = None
+            # Create a directory for downloaded files
+            if not os.path.exists(out_path):
+                os.mkdir(out_path)
+            while True:
+                results = drive_service.files().list(q=f"'{folder_id}' in parents", fields="nextPageToken, files(id, name)", pageToken=page_token).execute()
+                _files = results.get('files', [])
+                if not _files:
+                    print(f"No files found in the folder {drive_folder}")
+                    break
+                else:
+                    pool.map(fetch_files(_files, out_path, drive_service), len(_files))
+        
+                    page_token = results.get('nextPageToken')
+                    if not page_token:
+                        break
                     
-                    # delete stored files in Google Drive once it successfully downloaded
-                    deletefile = service.files().delete(fileId=file_id).execute()
+@retry(tries=20, delay=3, backoff=2)
+def download_files_from_gdrive(key_iam, drive_folder, out_path):
+    """
+        Args:
+            out_path: string
+            Specifying your output path folder to download all files
+            
+        Returns: void
+        
+    """
+    credentials = authenticate(key_iam)
+    if not credentials:
+        print("Authentication to Google Drive failed")
+        return
 
-        page_token = results.get('nextPageToken', None)
-
-        if page_token is None:
-            break
-
-if __name__ == '__main__':
-    main()
+    drive_service = build('drive', 'v3', credentials=credentials)
+    try:
+        pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+        download_files_in_folder(drive_folder, drive_service, out_path, pool)
+    finally:
+        pool.close()
+        pool.join()
